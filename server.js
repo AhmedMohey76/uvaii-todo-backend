@@ -3,25 +3,46 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
+const bcrypt = require('bcrypt'); // Use 'bcrypt' for the non-deprecated library
 
 // ----------------------------------------------------
 // 1. PRISMA SETUP (Database Client)
 // ----------------------------------------------------
-// Note: PrismaClient automatically uses the DATABASE_URL
-// from the .env file to connect to your SQLite (dev.db) database.
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 const app = express();
 const PORT = 3000;
 
-// IMPORTANT: Replace this with a strong, secret key for production
-const JWT_SECRET = 'your_super_secret_jwt_key_12345'; 
+// IMPORTANT: Use environment variable for JWT_SECRET
+const JWT_SECRET = process.env.JWT_SECRET || 'your_super_secret_jwt_key_12345'; 
 
 // Middleware
-app.use(cors());
+app.use(cors()); // CORS fix is correctly applied here
 app.use(express.json()); // Allows parsing of JSON request bodies
+
+// ----------------------------------------------------
+// CRITICAL HELPER: Map Prisma fields to Flutter fields
+// ----------------------------------------------------
+
+/**
+ * Maps a single Prisma Task object (using 'isDone') to a Flutter Task object (using 'completed').
+ * @param {Object} task - Prisma Task object
+ * @returns {Object} - Flutter compatible Task object
+ */
+const mapPrismaToFlutter = (task) => {
+    if (!task) return task;
+
+    // Destructure isDone and collect the rest of the properties
+    const { isDone, ...rest } = task;
+
+    return {
+        ...rest,
+        // CRITICAL FIX: Map 'isDone' (Prisma) to 'completed' (Flutter)
+        completed: isDone,
+    };
+};
+
 
 // ----------------------------------------------------
 // 2. AUTHENTICATION MIDDLEWARE
@@ -31,19 +52,21 @@ app.use(express.json()); // Allows parsing of JSON request bodies
  * Middleware to verify a JWT token in the request header and attach the user ID to the request.
  */
 const authenticateToken = (req, res, next) => {
-    // Get token from the Authorization header (Format: Bearer TOKEN)
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
     if (token == null) {
-        return res.sendStatus(401); // Unauthorized if no token
+        console.error("Authentication Error: Token missing.");
+        return res.status(401).json({ error: 'Unauthorized: Token missing.' });
     }
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
-            return res.sendStatus(403); // Forbidden if token is invalid or expired
+            console.error("Authentication Error: Invalid token or expired.", err);
+            // Force logout on the client side if the status is 403/401
+            return res.status(403).json({ error: 'Forbidden: Invalid or expired token.' });
         }
-        // Attach the user's ID (which is stored in the token payload) to the request
+        // Attach the user's ID (e.g., 1) from the database to the request.
         req.userId = user.userId; 
         next();
     });
@@ -55,15 +78,26 @@ const authenticateToken = (req, res, next) => {
 
 // Route to register a new user
 app.post('/api/register', async (req, res) => {
+    if (!req.body || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: 'Request body missing or invalid JSON format.' });
+    }
+    
     const { username, email, password } = req.body;
     
-    // Simple input validation
     if (!username || !email || !password) {
         return res.status(400).json({ error: 'Please provide username, email, and password.' });
     }
 
     try {
-        // Hash the password before saving it to the database
+        // Check for existing user first (P2002 handles the unique constraint, but this provides a clearer error message)
+        const existingUser = await prisma.user.findFirst({
+            where: { OR: [{ username: username }, { email: email }] }
+        });
+
+        if (existingUser) {
+            return res.status(409).json({ error: 'User with this username or email already exists.' });
+        }
+        
         const passwordHash = await bcrypt.hash(password, 10); 
 
         const newUser = await prisma.user.create({
@@ -74,8 +108,8 @@ app.post('/api/register', async (req, res) => {
             },
         });
 
-        // Generate JWT token upon successful registration
-        const token = jwt.sign({ userId: newUser.id }, JWT_SECRET, { expiresIn: '1h' });
+        // The userId payload for JWT must match the ID type (usually Int)
+        const token = jwt.sign({ userId: newUser.id }, JWT_SECRET, { expiresIn: '7d' });
 
         res.status(201).json({ 
             message: 'User registered successfully',
@@ -83,10 +117,7 @@ app.post('/api/register', async (req, res) => {
             user: { id: newUser.id, username: newUser.username, email: newUser.email }
         });
     } catch (error) {
-        // Handle duplicate email error
-        if (error.code === 'P2002') {
-            return res.status(409).json({ error: 'Email address already in use.' });
-        }
+        // P2002 error code is for unique constraint violation, which is handled above for clearer message.
         console.error('Registration Error:', error);
         res.status(500).json({ error: 'Server error during registration.' });
     }
@@ -94,6 +125,10 @@ app.post('/api/register', async (req, res) => {
 
 // Route to log in an existing user
 app.post('/api/login', async (req, res) => {
+    if (!req.body || Object.keys(req.body).length === 0) {
+        return res.status(400).json({ error: 'Request body missing or invalid JSON format.' });
+    }
+    
     const { email, password } = req.body;
 
     if (!email || !password) {
@@ -109,15 +144,14 @@ app.post('/api/login', async (req, res) => {
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
-        // Compare the provided password with the hashed password in the database
         const isValidPassword = await bcrypt.compare(password, user.passwordHash);
 
         if (!isValidPassword) {
             return res.status(401).json({ error: 'Invalid email or password.' });
         }
 
-        // Generate JWT token upon successful login
-        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '1h' });
+        // The userId payload for JWT must match the ID type (usually Int)
+        const token = jwt.sign({ userId: user.id }, JWT_SECRET, { expiresIn: '7d' });
 
         res.status(200).json({
             message: 'Login successful',
@@ -139,31 +173,38 @@ app.post('/api/login', async (req, res) => {
 // Middleware is applied to all task routes to ensure the user is logged in
 app.use('/api/tasks', authenticateToken);
 
+// This is the correct foreign key field name based on your schema
+const TASK_USER_FOREIGN_KEY = 'authorId'; 
 
-// GET all tasks for the authenticated user
+// GET all tasks for the authenticated user (READ)
 app.get('/api/tasks', async (req, res) => {
-    const userId = req.userId; // Retrieved from the JWT token via middleware
+    const authorId = parseInt(req.userId);
     
     try {
         const tasks = await prisma.task.findMany({
-            where: { authorId: userId },
-            orderBy: {
-                id: 'asc', // Sort by creation order
-            },
+            where: { [TASK_USER_FOREIGN_KEY]: authorId }, 
+            orderBy: [
+                { isDone: 'asc' }, // Order incomplete tasks first
+                { id: 'asc' }, 
+            ],
         });
-        res.status(200).json(tasks);
+        
+        // CRITICAL FIX: Map the results before sending to use 'completed'
+        const flutterTasks = tasks.map(mapPrismaToFlutter);
+
+        res.status(200).json(flutterTasks);
     } catch (error) {
         console.error('Fetch Tasks Error:', error);
         res.status(500).json({ error: 'Failed to fetch tasks.' });
     }
 });
 
-// POST a new task for the authenticated user
+// POST a new task for the authenticated user (CREATE)
 app.post('/api/tasks', async (req, res) => {
-    const userId = req.userId;
+    const authorId = parseInt(req.userId);
     const { title } = req.body;
 
-    if (!title) {
+    if (!title || title.trim() === '') {
         return res.status(400).json({ error: 'Task title is required.' });
     }
 
@@ -171,42 +212,69 @@ app.post('/api/tasks', async (req, res) => {
         const newTask = await prisma.task.create({
             data: {
                 title,
-                authorId: userId,
+                [TASK_USER_FOREIGN_KEY]: authorId, 
+                isDone: false, 
             },
         });
-        res.status(201).json(newTask);
+        
+        // CRITICAL FIX: Map the result before sending to use 'completed'
+        res.status(201).json(mapPrismaToFlutter(newTask));
     } catch (error) {
         console.error('Create Task Error:', error);
         res.status(500).json({ error: 'Failed to create task.' });
     }
 });
 
-// PUT/UPDATE an existing task
+// PUT/UPDATE an existing task (UPDATE)
 app.put('/api/tasks/:id', async (req, res) => {
-    const userId = req.userId;
+    const authorId = parseInt(req.userId);
     const taskId = parseInt(req.params.id);
-    const { title, completed } = req.body;
+    
+    // CRITICAL FIX: Accept 'completed' from Flutter body. Also accept 'isDone' for flexibility.
+    const { title, isDone: isDoneBody, completed } = req.body; 
+
+    if (isNaN(taskId)) {
+        return res.status(400).json({ error: 'Invalid task ID.' });
+    }
+    
+    const updateData = {};
+    if (title !== undefined && title !== null) {
+        if (title.trim() === '') {
+            return res.status(400).json({ error: 'Task title cannot be empty.' });
+        }
+        updateData.title = title;
+    }
+    
+    // Map incoming 'completed' (Flutter) to 'isDone' (Prisma)
+    if (completed !== undefined && completed !== null) {
+        updateData.isDone = completed; 
+    } else if (isDoneBody !== undefined && isDoneBody !== null) {
+        // Allow isDone for non-Flutter clients (like Postman)
+        updateData.isDone = isDoneBody;
+    }
+    
+    if (Object.keys(updateData).length === 0) {
+        return res.status(400).json({ error: 'Must provide title or completed status for update.' });
+    }
 
     try {
-        // Update task, but only if it belongs to the authenticated user
-        const updatedTask = await prisma.task.updateMany({
+        const updatedTaskResult = await prisma.task.updateMany({
             where: {
                 id: taskId,
-                authorId: userId,
+                [TASK_USER_FOREIGN_KEY]: authorId, // Match task to user
             },
-            data: {
-                title: title,
-                completed: completed,
-            },
+            data: updateData,
         });
 
-        if (updatedTask.count === 0) {
+        if (updatedTaskResult.count === 0) {
             return res.status(404).json({ error: 'Task not found or unauthorized.' });
         }
         
         // Fetch the updated task to return the full object
         const task = await prisma.task.findUnique({ where: { id: taskId } });
-        res.status(200).json(task);
+        
+        // CRITICAL FIX: Map the result before sending to use 'completed'
+        res.status(200).json(mapPrismaToFlutter(task));
 
     } catch (error) {
         console.error('Update Task Error:', error);
@@ -214,17 +282,20 @@ app.put('/api/tasks/:id', async (req, res) => {
     }
 });
 
-// DELETE a task
+// DELETE a task (DELETE)
 app.delete('/api/tasks/:id', async (req, res) => {
-    const userId = req.userId;
+    const authorId = parseInt(req.userId);
     const taskId = parseInt(req.params.id);
 
+    if (isNaN(taskId)) {
+        return res.status(400).json({ error: 'Invalid task ID.' });
+    }
+
     try {
-        // Delete task, but only if it belongs to the authenticated user
         const deletedTask = await prisma.task.deleteMany({
             where: {
                 id: taskId,
-                authorId: userId,
+                [TASK_USER_FOREIGN_KEY]: authorId, // Match task to user
             },
         });
 
@@ -255,11 +326,9 @@ app.get('/', (req, res) => {
  */
 async function connectToDatabaseAndStartServer() {
     try {
-        // This command forces Prisma to connect to the database and ensures it's reachable.
         await prisma.$connect();
         console.log("✅ Database connection successful!");
 
-        // Start the server only if the database connection succeeds
         app.listen(PORT, () => {
             console.log(`Server running on port ${PORT}...`);
             console.log(`API URL: http://localhost:${PORT}`);
@@ -269,7 +338,6 @@ async function connectToDatabaseAndStartServer() {
         console.error("❌ FATAL ERROR: Database connection failed.");
         console.error("Please check your DATABASE_URL in the .env file and ensure the database is running.");
         console.error(error);
-        // Exit the process if the database cannot be reached
         process.exit(1); 
     }
 }
